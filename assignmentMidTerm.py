@@ -9,16 +9,14 @@ class Hp():
     def __init__(self,
                  epsiode_num = 1000,
                  episode_length=2000,
-                 learning_rate=0.02,
                  num_deltas=16,
                  num_best_deltas=16,
-                 noise=0.03,
+                 noise=0.02,
                  seed=1,
                  env_name='BipedalWalker-v2',
                  record_every=50):
         self.epsiode_num = epsiode_num
         self.episode_length = episode_length
-        self.learning_rate = learning_rate
         self.num_deltas = num_deltas
         self.num_best_deltas = num_best_deltas
         assert self.num_best_deltas <= self.num_deltas
@@ -60,7 +58,7 @@ class SampleNormalizer():
 
 
 class PerceptronModel():
-    def __init__(self, x_size, action_size, learning_rate = 0.1):
+    def __init__(self, x_size, action_size, learning_rate = 0.02):
         self.W = np.zeros((action_size, x_size))
         self.learning_rate = learning_rate
 
@@ -70,8 +68,14 @@ class PerceptronModel():
     def update(self, rollouts, reward_std):
         # sigma_rewards is the standard deviation of the rewards
         r_pos, r_neg, deltas = rollouts
-        step = np.average(deltas, axis=0, weights=(r_pos-r_neg))
+        step = np.dot(deltas.transpose([1,2,0]),(r_pos - r_neg))/r_pos.shape[0]
         self.W += self.learning_rate * step/reward_std
+
+        #step = np.zeros(self.W.shape)
+        #num_best_deltas = rollouts[0].shape[0]
+        #for r_pos, r_neg, delta in zip(*rollouts):
+        #    step += (r_pos - r_neg) * delta
+        #self.W += self.learning_rate / (num_best_deltas * reward_std) * step
 
 
 class ArsTrainer():
@@ -104,7 +108,7 @@ class ArsTrainer():
         sum_rewards = 0.0
         while not done and num_plays < self.hp.episode_length:
             normalized_state = self.normalizer.normalized_x(state)
-            action = self.model.predict(state)
+            action = self.model.predict(normalized_state)
             state, reward, done, _ = self.env.step(action)
             reward = max(min(reward, 1), -1)
             sum_rewards += reward
@@ -167,7 +171,7 @@ class ArsTrainer():
                 self.record_video = True
             # Play an episode with the new weights and print the score
             reward_evaluation = self.evaluate()
-            print('Eposiode: ', eposide, 'Reward: ', reward_evaluation)
+            print('Eposiode: ', eposide, 'Reward: ', reward_evaluation,'Reward Std:',reward_std)
             self.record_video = False
 
 

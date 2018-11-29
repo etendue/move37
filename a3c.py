@@ -6,6 +6,7 @@ import numpy as np
 import collections
 import os
 import copy
+from tensorboardX import SummaryWriter
 
 import torch
 import torch.nn as nn
@@ -15,10 +16,11 @@ import torch.multiprocessing as mp
 from torch.distributions.categorical import Categorical
 
 GAMMA = 0.99
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0005
 ENTROPY_BETA = 0.01
-BATCH_SIZE = 128
-TAU = 0.1
+BATCH_SIZE = 64
+TAU = 0.05
+N_STEP = 8
 
 TOTAL_ENVS = 48
 PROCESSES_COUNT = max((mp.cpu_count() - 2),1)
@@ -78,14 +80,20 @@ def data_func(net,device, train_queue):
     while True:
 
         for i,env in enumerate(envs):
-            s = states[i]
-            a = agent.get_action(s)
-            next_s,r,done, _ = env.step(a)
-            if done:
-                next_s = env.reset()
-            states[i] = next_s
-            train_queue.put(Transition(s,a,r,next_s, done))
+            s0 = states[i]
+            a0 = agent.get_action(s0)
+            a = a0
+            r_total = 0.0
+            for j in range(N_STEP):
+                next_s,r,done, _ = env.step(a)
+                r_total = r_total + r * GAMMA**j
+                if done:
+                    next_s = env.reset()
+                    break
+                a = agent.get_action(next_s)
 
+            states[i] = next_s
+            train_queue.put(Transition(s0,a0,r_total,next_s, done))
 
 if __name__ == "__main__":
 
@@ -96,19 +104,19 @@ if __name__ == "__main__":
 
     env = gym.make(ENV_NAME)
     actor = nn.Sequential(
-        nn.Linear(env.observation_space.shape[0], 64),
+        nn.Linear(env.observation_space.shape[0], 128),
         nn.ReLU(),
-        nn.Linear(64,128),
+        nn.Linear(128, 256),
         nn.ReLU(),
-        nn.Linear(128,env.action_space.n)
+        nn.Linear(256,env.action_space.n)
     ).to(device)
 
     critic = nn.Sequential(
         nn.Linear(env.observation_space.shape[0], 64),
         nn.ReLU(),
-        nn.Linear(64,64),
+        nn.Linear(64,128),
         nn.ReLU(),
-        nn.Linear(64,1)
+        nn.Linear(128,1)
     ).to(device)
 
     critic_target = copy.deepcopy(critic)
@@ -119,8 +127,8 @@ if __name__ == "__main__":
     print(actor)
     print(critic)
 
-    optim_actor = optim.Adam(actor.parameters(), lr=LEARNING_RATE, eps=1e-3)
-    optim_critic = optim.Adam(critic.parameters(), lr=LEARNING_RATE, eps=1e-3)
+    optim_actor = optim.Adam(actor.parameters(), lr=LEARNING_RATE)
+    optim_critic = optim.Adam(critic.parameters(), lr=LEARNING_RATE)
 
     train_queue = mp.Queue(maxsize=PROCESSES_COUNT)
     data_proc_list = []
@@ -133,17 +141,34 @@ if __name__ == "__main__":
     batch = []
     step_idx = 0
 
+    writer = SummaryWriter(comment="NStep_{}.log".format(N_STEP))
+
+    # envs = [gym.make(ENV_NAME) for _ in range(ENVS_PER_PROCESS)]
+    # agent = PGAgent(actor, device)
+    # states = [env.reset() for env in envs]
+
     try:
         while True:
+
+            # for i, env in enumerate(envs):
+            #     s = states[i]
+            #     a = agent.get_action(s)
+            #     next_s, r, done, _ = env.step(a)
+            #     if done:
+            #         next_s = env.reset()
+            #     states[i] = next_s
+            #     batch.append(Transition(s, a, r, next_s, done))
             # Get one transition from the training queue
             train_entry = train_queue.get()
 
             # keep receiving data until one batch is full
             batch.append(train_entry)
+            step_idx += 1
+
             if len(batch) < BATCH_SIZE:
                 continue
 
-            step_idx += 1
+
             transitions = Transition(*zip(*batch))
             states_t = torch.FloatTensor(transitions.state).to(device)
             actions_t = torch.LongTensor(transitions.action).to(device)
@@ -184,12 +209,19 @@ if __name__ == "__main__":
             L_actor.backward()
             optim_actor.step()
 
+            writer.add_scalar("Entropy", entropy,step_idx)
+            writer.add_scalar("Critic_Loss",L_critic,step_idx)
+            writer.add_scalar("Actor_Loss",L_actor,step_idx)
+            writer.add_scalar("V_mean",predicted_states_v.mean(),step_idx)
 
-            if step_idx % 100 == 0:
+            if step_idx % 512 == 0:
                 score = evaluate(env, agent, n_games=5)
-                print("Batch {}: with score : {:.3f}".format(step_idx,score))
+                print("Step {}: with score : {:.3f}".format(step_idx,score))
+                writer.add_scalar("Score",score,step_idx)
                 if score >= REWARD_BOUND:
-                    break
+                    score = evaluate(env, agent, n_games=5)
+                    if score >= REWARD_BOUND:
+                        break
 
     finally:
         for p in data_proc_list:

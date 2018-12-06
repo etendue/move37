@@ -7,11 +7,13 @@ import numpy as np
 from collections import namedtuple
 from tensorboardX import SummaryWriter
 
+
 def run_step(env,a):
     next_s,r,done, _ = env.step(a)
     if done:
         next_s = env.reset()
     return Transition(None,a,r,next_s,done)
+
 
 class PGAgent():
     def __init__(self,model,device):
@@ -25,6 +27,7 @@ class PGAgent():
         logits = self.model(s).detach()
         m = Categorical(logits = logits)
         return m.sample().cpu().data.numpy().tolist()[0]
+
 
 def evaluate(env, agent, n_games=1):
     """ Plays n_games full games. If greedy, picks actions as argmax(qvalues). Returns mean reward. """
@@ -43,6 +46,7 @@ def evaluate(env, agent, n_games=1):
         rewards.append(reward)
 
     return np.mean(rewards)
+
 
 Transition = namedtuple('Transition',('state', 'action', 'reward','next_state','done'))
 

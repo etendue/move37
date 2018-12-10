@@ -6,36 +6,9 @@ import torch.nn.functional as F
 import numpy as np
 from collections import namedtuple
 from tensorboardX import SummaryWriter
-import random
+from collections import deque
 import torch.multiprocessing as mp
 import os
-
-
-class BatchEnv():
-    def __init__(self,env_name, n):
-        self.env_name = env_name
-        self.n = n
-        self.envs = [gym.make(env_name) for _ in range(n)]
-        self.states = []
-        self.total_rewards = []
-
-    def step(self, actions, steps=1):
-        transitions = []
-        for i in range(self.n):
-            r_sum = 0.0
-            for j in range(steps):
-                next_s, r, done, _ = self.envs[i].step(actions[i])
-                r_sum += r
-                if done:
-                    next_s = self.envs[i].reset()
-                    break
-
-            transitions.append(Transition(self.states[i], actions[i], r, next_s, done))
-            self.states[i] = next_s
-        return transitions
-
-    def reset(self):
-        self.states = [env.reset() for env in self.envs]
 
 
 class PGAgent():
@@ -54,8 +27,10 @@ class PGAgent():
 
 
 class ActorNet(nn.Module):
-    def __init__(self, n_in, n_out, hid1_size=128, hid2_size=64):
+    def __init__(self, n_in, n_out, hid1_size=128, hid2_size=128):
         super(ActorNet, self).__init__()
+        self.n_in = n_in
+        self.n_out = n_out
         self.layer1 = nn.Linear(n_in, hid1_size)
         self.layer2 = nn.Linear(hid1_size, hid2_size)
         self.mu = nn.Linear(hid2_size, n_out)
@@ -100,41 +75,52 @@ def evaluate(env, agent, n_games=1):
     return np.mean(rewards)
 
 
-def evaluation_thread(x,y, device, in_queue, out_queue):
+def work_thread(agent, event, t_queue, score_queue):
     # each process runs multiple instances of the environment, round-robin
-    print("start evaluation process:", os.getpid())
-    model = ActorNet(x, y).to(device)
-    agent = PGAgent(model, device)
+    print("start work process:", os.getpid())
     env = gym.make(GAME)
+    t_max = env.spec.timestep_limit or 1000
 
     while True:
-        step_idx, model = in_queue.get()
-        agent.model.load_state_dict(model.state_dict())
-        score = evaluate(env, agent, n_games=5)
-        print("Step {}: with score : {:.3f}".format(step_idx, score))
-        if score >= WIN_SCORE:
-            torch.save(model.state_dict(), "checkpoint_win.pt")
-            break
-        out_queue.put([step_idx, score])
+        total_reward = 0.0
+        s = env.reset()
+        for i in range(t_max):
+            event.wait()
+            a = agent.get_action([s])[0]
+            next_s, r, done, _ = env.step(a)
+            total_reward += r
+            # special case that time/step limit is reached.
+            if i == t_max - 1:
+                score_queue.put([total_reward, r, i])
+                done = False
+                t_queue.put(Transition(s, a, r, next_s, done))
+                break
+
+            if done:
+                score_queue.put([total_reward, r, i])
+                t_queue.put(Transition(s, a, r, next_s, done))
+                break
+
+            t_queue.put(Transition(s, a, r, next_s, done))
+            s = next_s
 
 
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
 
 # for training
-STEPS = 20000
+STEPS = 200000
 LEARNING_RATE = 0.001
-BATCH_SIZE = 32
-ENV_SIZE = 32
-BETA = 0.05
-GAMMA = 1.0
-TAU = 0.01
+BATCH_SIZE = 64
+
+BETA = 0.15
+GAMMA = 0.99
+TAU = 0.005
 GAME = "LunarLanderContinuous-v2"
 # GAME = 'BipedalWalker-v2'
 WIN_SCORE = 200
 CPU_NUM = mp.cpu_count()
-EVAL_NUM = max(1, CPU_NUM - 2)
+WORKER_NUM = max(1, CPU_NUM - 2)
 
-batch_envs = BatchEnv(GAME,ENV_SIZE)
 # for evaluation
 eval_env = gym.make(GAME)
 
@@ -142,48 +128,61 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 x, y = eval_env.observation_space.shape[0], eval_env.action_space.shape[0]
 
 actor = ActorNet(x, y).to(device)
-actor_eval = ActorNet(x, y).to(device)
+actor.share_memory()
+
 critic = CriticNet(x, 1).to(device)
 critic_target = CriticNet(x, 1).to(device)
 critic_target.load_state_dict(critic.state_dict())
-actor_eval.share_memory()
-actor_eval.load_state_dict(actor.state_dict())
+
 
 agent = PGAgent(actor, device)
 
 optimizer_actor = torch.optim.Adam(actor.parameters(), lr=LEARNING_RATE)
 optimizer_critic = torch.optim.Adam(critic.parameters(), lr=LEARNING_RATE)
 
-eval_env.seed(0)
 torch.random.manual_seed(0)
-batch_envs.reset()
+
 
 writer = SummaryWriter(comment="a2c_continuous")
 
-eval_inqueue = mp.Queue(maxsize=1)
-eval_outqueue = mp.Queue(maxsize=1)
+t_queue = mp.Queue(maxsize=BATCH_SIZE)
+score_queue = mp.Queue(maxsize=WORKER_NUM)
+working_event = mp.Event()
 
 
-eval_proc_list = []
-for _ in range(EVAL_NUM):
-    eval_proc = mp.Process(target=evaluation_thread, args=(x, y, device,eval_inqueue,eval_outqueue))
-    eval_proc_list.append(eval_proc)
-    eval_proc.start()
+proc_list = []
+for _ in range(WORKER_NUM):
+    work_proc = mp.Process(target=work_thread, args=(agent, working_event, t_queue, score_queue))
+    proc_list.append(work_proc)
+    work_proc.start()
+
+working_event.set()
+
+batch_transitions = []
+score_history = deque(maxlen=5)
+bingo = 0
 
 try:
 
     for step_idx in range(STEPS):
 
-        actions = agent.get_action(batch_envs.states)
-        batch_transitions = batch_envs.step(actions)
+        # collecting transitions
+        transition = t_queue.get()
+        batch_transitions.append(transition)
+        if len(batch_transitions) < BATCH_SIZE:
+            continue
+        # Pause worker for collecting experience
+        working_event.clear()
 
+        # convert transitions to tensor
         batch = Transition(*zip(*batch_transitions))
-
         states_t = torch.FloatTensor(batch.state).to(device)
         actions_t = torch.FloatTensor(batch.action).to(device)
         next_states_t = torch.FloatTensor(batch.next_state).to(device)
         rewards_t = torch.FloatTensor(batch.reward).to(device)
         done_t = torch.FloatTensor(batch.done).to(device)
+
+        batch_transitions.clear()
 
         # critic loss
         predicted_states_v = critic(states_t).squeeze()
@@ -201,7 +200,6 @@ try:
         mu, var = actor(states_t)
         m = Normal(mu, var)
         log_probs_t = m.log_prob(actions_t)
-        #log_probs_t = log_probs_t.clamp(min=-20)  # for numerical stability
         advantages_t = (target_states_v - predicted_states_v).detach()
         J_actor = (advantages_t.unsqueeze(-1) * log_probs_t).mean()
 
@@ -213,10 +211,12 @@ try:
         L_actor.backward()
         optimizer_actor.step()
 
-        # update actor_env
-        if eval_inqueue.empty():
-            actor_eval.load_state_dict(actor.state_dict())
-            eval_inqueue.put([step_idx, actor_eval])
+        # removing invalid experience
+        while not t_queue.empty():
+            t_queue.get()
+
+        # start worker again
+        working_event.set()
 
         # smooth update target
         for target_param, new_param in zip(critic_target.parameters(), critic.parameters()):
@@ -228,16 +228,24 @@ try:
         writer.add_scalar("V", predicted_states_v.mean(),step_idx)
 
         # read evaluation result
-        if not eval_outqueue.empty():
-            idx, score = eval_outqueue.get()
-            writer.add_scalar("Score", score, idx)
-            if score >= WIN_SCORE:
-                print("Reach the target score of 5 games")
-                break
+        if not score_queue.empty():
+            score, last_r, count = score_queue.get()
+            score_history.append(score)
+            writer.add_scalar("Score", score, step_idx)
+            if last_r == 100:
+                bingo += 1
+            print("Batch {} : Score {:.2f}, steps {}, last r {:.2f}, bingo {}". format(step_idx, score, count,last_r,bingo))
+
+            if np.mean(score_history) >= WIN_SCORE:
+
+                validate_score = evaluate(eval_env, agent, n_games=5)
+                if validate_score > WIN_SCORE:
+                    print("Reach the target score of 5 games")
+                    break
 
 
 finally:
-    for p in eval_proc_list:
+    for p in proc_list:
         p.terminate()
         p.join()
 

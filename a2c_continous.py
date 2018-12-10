@@ -17,13 +17,18 @@ class BatchEnv():
         self.n = n
         self.envs = [gym.make(env_name) for _ in range(n)]
         self.states = []
+        self.total_rewards = []
 
-    def step(self, actions):
+    def step(self, actions, steps=1):
         transitions = []
         for i in range(self.n):
-            next_s, r, done, _ = self.envs[i].step(actions[i])
-            if done:
-                next_s = self.envs[i].reset()
+            r_sum = 0.0
+            for j in range(steps):
+                next_s, r, done, _ = self.envs[i].step(actions[i])
+                r_sum += r
+                if done:
+                    next_s = self.envs[i].reset()
+                    break
 
             transitions.append(Transition(self.states[i], actions[i], r, next_s, done))
             self.states[i] = next_s
@@ -45,7 +50,7 @@ class PGAgent():
         with torch.no_grad():
             mu, var = self.model(s)
         m = Normal(mu, var)
-        return m.sample().cpu().data.numpy().clip(-1, 1)
+        return m.sample().cpu().data.numpy()
 
 
 class ActorNet(nn.Module):
@@ -95,14 +100,16 @@ def evaluate(env, agent, n_games=1):
     return np.mean(rewards)
 
 
-def evaluation_thread(env, device, in_queue, sout_queue):
+def evaluation_thread(x,y, device, in_queue, out_queue):
     # each process runs multiple instances of the environment, round-robin
     print("start evaluation process:", os.getpid())
-    agent = PGAgent(None, device)
+    model = ActorNet(x, y).to(device)
+    agent = PGAgent(model, device)
+    env = gym.make(GAME)
 
     while True:
         step_idx, model = in_queue.get()
-        agent.model = model
+        agent.model.load_state_dict(model.state_dict())
         score = evaluate(env, agent, n_games=5)
         print("Step {}: with score : {:.3f}".format(step_idx, score))
         if score >= WIN_SCORE:
@@ -118,12 +125,14 @@ STEPS = 20000
 LEARNING_RATE = 0.001
 BATCH_SIZE = 32
 ENV_SIZE = 32
-BETA = 0.001
-GAMMA = 0.99
-TAU = 0.02
+BETA = 0.05
+GAMMA = 1.0
+TAU = 0.01
 GAME = "LunarLanderContinuous-v2"
 # GAME = 'BipedalWalker-v2'
 WIN_SCORE = 200
+CPU_NUM = mp.cpu_count()
+EVAL_NUM = max(1, CPU_NUM - 2)
 
 batch_envs = BatchEnv(GAME,ENV_SIZE)
 # for evaluation
@@ -155,8 +164,11 @@ eval_inqueue = mp.Queue(maxsize=1)
 eval_outqueue = mp.Queue(maxsize=1)
 
 
-eval_proc = mp.Process(target=evaluation_thread, args=(eval_env, device,eval_inqueue,eval_outqueue))
-eval_proc.start()
+eval_proc_list = []
+for _ in range(EVAL_NUM):
+    eval_proc = mp.Process(target=evaluation_thread, args=(x, y, device,eval_inqueue,eval_outqueue))
+    eval_proc_list.append(eval_proc)
+    eval_proc.start()
 
 try:
 
@@ -189,7 +201,7 @@ try:
         mu, var = actor(states_t)
         m = Normal(mu, var)
         log_probs_t = m.log_prob(actions_t)
-        log_probs_t = log_probs_t.clamp(min=-20) # for numerical stability
+        #log_probs_t = log_probs_t.clamp(min=-20)  # for numerical stability
         advantages_t = (target_states_v - predicted_states_v).detach()
         J_actor = (advantages_t.unsqueeze(-1) * log_probs_t).mean()
 
@@ -213,19 +225,19 @@ try:
         writer.add_scalar("Entropy", entropy, step_idx)
         writer.add_scalar("Critic_Loss", L_critic, step_idx)
         writer.add_scalar("Actor_Loss", L_actor, step_idx)
-        writer.add_scalar("V",predicted_states_v.mean(),step_idx)
+        writer.add_scalar("V", predicted_states_v.mean(),step_idx)
 
         # read evaluation result
         if not eval_outqueue.empty():
             idx, score = eval_outqueue.get()
             writer.add_scalar("Score", score, idx)
             if score >= WIN_SCORE:
-                print("Reach the target score 300 of 5 games")
+                print("Reach the target score of 5 games")
                 break
 
 
 finally:
-
-    eval_proc.terminate()
-    eval_proc.join()
+    for p in eval_proc_list:
+        p.terminate()
+        p.join()
 
